@@ -1,114 +1,68 @@
 const http = require('http');
 const https = require('https');
-const url = require('url');
-const cors_anywhere = require('./lib/cors-anywhere'); // Ensure this path is correct
 
-// --- CORS Anywhere Setup ---
-const corsProxy = cors_anywhere.createServer({
-    originBlacklist: parseEnvList(process.env.CORSANYWHERE_BLACKLIST),
-    originWhitelist: parseEnvList(process.env.CORSANYWHERE_WHITELIST),
-    requireHeader: ['origin', 'x-requested-with'],
-    removeHeaders: ['cookie', 'cookie2'],
-    redirectSameOrigin: true,
-    httpProxyOptions: { xfwd: false },
-});
+const PORT = 3000;
 
-function parseEnvList(env) {
-    return env ? env.split(',') : [];
-}
-
-// --- The Main Handler (Router) ---
-module.exports = (req, res) => {
-    const { pathname } = url.parse(req.url);
-
-    // 1. Route to CORS Anywhere
-    if (pathname.startsWith('/anywhere')) {
-        // Strip the '/anywhere' prefix before passing to cors-anywhere
-        req.url = req.url.replace(/^\/anywhere/, '');
-        return corsProxy.emit('request', req, res);
-    }
-
-    // 2. Route to Custom Proxy
-    if (pathname.startsWith('/proxy')) {
-        return handleCustomProxy(req, res);
-    }
-
-    // 3. Fallback
-    res.statusCode = 404;
-    res.end('Not Found. Use /anywhere/URL or /proxy/URL');
-};
-
-// --- Custom Proxy Logic ---
-function handleCustomProxy(req, res) {
+const server = http.createServer((req, res) => {
+    // 1. Manually handle CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', '*');
 
     if (req.method === 'OPTIONS') {
         res.writeHead(200);
-        return res.end();
+        res.end();
+        return;
     }
 
-    // 1. Clean the URL
-    // Removes '/proxy/' prefix and any leading slashes
-    let targetPath = req.url.replace(/^\/proxy\/?/, '');
-    
-    if (!targetPath) {
-        res.writeHead(400);
-        return res.end('Error: No target URL provided');
-    }
+    // 2. Define target (Safely removing the proxy prefix to avoid 'https:///' issues)
+    const targetPath = req.url.replace(/^\/proxy\/?/, '');
+    const initialUrl = 'https://' + targetPath;
 
-    // 2. Ensure it's a full URL
-    const initialUrl = targetPath.startsWith('http') ? targetPath : 'https://' + targetPath;
+    console.log(`Forwarding to: ${initialUrl}`);
 
-    console.log(`Proxying to: ${initialUrl}`);
-
+    // 3. Function to perform the request and follow redirects automatically
     function fetchUrl(currentUrl, redirectCount = 0) {
+        // Prevent infinite redirect loops
         if (redirectCount > 5) {
             res.writeHead(500);
             return res.end('Proxy Error: Too many redirects');
         }
 
-        try {
-            const request = https.get(currentUrl, (proxyRes) => {
-                // Handle Redirects
-                if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
-                    const nextUrl = new URL(proxyRes.headers.location, currentUrl).href;
-                    return fetchUrl(nextUrl, redirectCount + 1);
-                }
+        https.get(currentUrl, (proxyRes) => {
+            // Check if the server responded with a redirect
+            if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
+                // Safely resolve the new URL (handles both relative and absolute redirect paths)
+                const nextUrl = new URL(proxyRes.headers.location, currentUrl).href;
+                console.log(`[Redirect ${proxyRes.statusCode}] Following to: ${nextUrl}`);
+                
+                // Recursively call the function with the new URL
+                return fetchUrl(nextUrl, redirectCount + 1);
+            }
 
-                // Forward Headers
-                const headersToForward = { ...proxyRes.headers };
-                delete headersToForward['host'];
-                delete headersToForward['connection'];
-                delete headersToForward['content-encoding']; // Avoid double-compression issues
+            // If it's not a redirect, prepare to send the data back to the browser
+            // It's best practice to forward all safe headers, not just Content-Type
+            const headersToForward = { ...proxyRes.headers };
+            
+            // Remove headers that shouldn't be proxied blindly
+            delete headersToForward['host'];
+            delete headersToForward['connection'];
 
-                res.writeHead(proxyRes.statusCode, headersToForward);
-                proxyRes.pipe(res);
-            });
+            res.writeHead(proxyRes.statusCode, headersToForward);
 
-            request.on('error', (e) => {
-                console.error("Fetch Error:", e.message);
-                if (!res.headersSent) {
-                    res.writeHead(500);
-                    res.end('Proxy Error: ' + e.message);
-                }
-            });
-
-            // Set a timeout to prevent hanging
-            request.setTimeout(8000, () => {
-                request.destroy();
-                if (!res.headersSent) {
-                    res.writeHead(504);
-                    res.end('Gateway Timeout');
-                }
-            });
-
-        } catch (err) {
+            // Pipe the data directly
+            proxyRes.pipe(res);
+            
+        }).on('error', (e) => {
             res.writeHead(500);
-            res.end('Invalid URL or Protocol');
-        }
+            res.end('Proxy Error: ' + e.message);
+        });
     }
 
+    // Start the initial fetch
     fetchUrl(initialUrl);
-}
+});
+
+server.listen(PORT, () => {
+    console.log(`Legacy Proxy running on http://localhost:${PORT}`);
+});
