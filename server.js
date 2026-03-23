@@ -21,18 +21,9 @@ var checkRateLimit = require('./lib/rate-limit')(process.env.CORSANYWHERE_RATELI
 
 var cors_proxy = require('./lib/cors-anywhere');
 cors_proxy.createServer({
-var originBlacklist = parseEnvList(process.env.CORSANYWHERE_BLACKLIST);
-
-// Hardcode the whitelist here - make sure there is a semicolon at the end!
-var originWhitelist = ['https://starnhl.com', 'https://www.starnhl.com']; 
-
-function parseEnvList(env) {
-  if (!env) {
-    return [];
-  }
-  return env.split(',');
-}
-requireHeader: ['origin', 'x-requested-with'],
+  originBlacklist: originBlacklist,
+  originWhitelist: ['https://starnhl.com', 'http://www.starnhl.com'],
+  requireHeader: ['origin', 'x-requested-with'],
   checkRateLimit: checkRateLimit,
   removeHeaders: [
     'cookie',
