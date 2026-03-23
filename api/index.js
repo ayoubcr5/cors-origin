@@ -4,73 +4,60 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const app = express();
 
-// 1. Configure CORS to only allow starnhl.com
-const allowedOrigins = [
-    'https://starnhl.com', 
-    'https://www.starnhl.com'
-];
+// 1. Expanded CORS for testing (You can restrict this to starnhl.com later)
+app.use(cors({
+    origin: true, // Allows any origin to bypass CORS for testing
+    credentials: true
+}));
 
-const corsOptions = {
-    origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl) 
-        // Remove "!origin" if you want to be extremely strict
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error('Access denied: Unauthorized Origin'));
-        }
-    }
-};
+app.get('/', (req, res) => res.send('OQEE Proxy Active'));
 
-app.use(cors(corsOptions));
-
-// 2. Security Middleware to block non-browser/direct access
-app.use((req, res, next) => {
-    const origin = req.get('origin') || req.get('referer');
-    
-    // Check if the request is coming from your domain
-    const isAllowed = allowedOrigins.some(domain => origin && origin.startsWith(domain));
-
-    if (!isAllowed) {
-        return res.status(403).send('Forbidden: Access allowed only from starnhl.com');
-    }
-    next();
-});
-
-/**
- * Proxy 1: ?url= style
- */
-app.get('/proxy', (req, res, next) => {
-    const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).send('Missing url parameter');
-
-    createProxyMiddleware({
-        target: targetUrl,
-        changeOrigin: true,
-        pathRewrite: { '^/proxy': '' },
-        onProxyRes: (proxyRes) => {
-            // Ensure the response headers also reflect your specific domain
-            proxyRes.headers['Access-Control-Allow-Origin'] = req.get('origin') || 'https://starnhl.com';
-        }
-    })(req, res, next);
-});
-
-/**
- * Proxy 2: /url style (CORS Anywhere)
- */
+// 2. The Universal Proxy Handler
 app.use('/:targetUrl*', (req, res, next) => {
-    const targetUrl = req.params.targetUrl + req.params[0];
-    if (!targetUrl || targetUrl === 'favicon.ico') return next();
+    // Reconstruct the URL from the full path to avoid slash-collapsing issues
+    let rawPath = req.url.substring(1); // Removes the leading "/"
+    
+    // Fix: If Vercel/Express collapsed https:// into https:/
+    if (rawPath.startsWith('http:/') && !rawPath.startsWith('http://')) {
+        rawPath = rawPath.replace('http:/', 'http://');
+    } else if (rawPath.startsWith('https:/') && !rawPath.startsWith('https://')) {
+        rawPath = rawPath.replace('https:/', 'https://');
+    }
 
-    createProxyMiddleware({
+    if (!rawPath || rawPath === 'favicon.ico') return next();
+
+    // Determine the base target (The domain)
+    let targetUrl;
+    try {
+        const urlObj = new URL(rawPath);
+        targetUrl = urlObj.origin;
+    } catch (e) {
+        return res.status(400).send('Invalid Target URL');
+    }
+
+    return createProxyMiddleware({
         target: targetUrl,
         changeOrigin: true,
-        pathRewrite: (path) => path.replace(/^\//, ''),
-        onProxyRes: (proxyRes) => {
-            proxyRes.headers['Access-Control-Allow-Origin'] = req.get('origin') || 'https://starnhl.com';
+        followRedirects: true,
+        pathRewrite: (path) => {
+            // This extracts just the path part from the full URL provided
+            // e.g., from https://site.com/video.mpd, it keeps /video.mpd
+            const fullUrl = path.substring(1).replace('https:/', 'https://').replace('http:/', 'http://');
+            return new URL(fullUrl).pathname + new URL(fullUrl).search;
+        },
+        onProxyRes: (proxyRes, req, res) => {
+            // CRITICAL: Overwrite CORS headers from the original server
+            proxyRes.headers['Access-Control-Allow-Origin'] = '*';
+            proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+            proxyRes.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization';
+            
+            // For Video Streaming (.mpd, .m3u8)
+            delete proxyRes.headers['content-security-policy'];
+        },
+        onError: (err, req, res) => {
+            res.status(500).send('Proxy Error');
         }
     })(req, res, next);
 });
 
-const port = process.env.PORT || 8080;
-app.listen(port, () => console.log(`Secure Proxy running for starnhl.com on port ${port}`));
+module.exports = app;
