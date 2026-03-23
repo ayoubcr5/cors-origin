@@ -1,49 +1,83 @@
-// Listen on a specific host via the HOST environment variable
-var host = process.env.HOST || '0.0.0.0';
-// Listen on a specific port via the PORT environment variable
-var port = process.env.PORT || 8080;
+const http = require('http');
+const https = require('https');
+const url = require('url');
+const cors_anywhere = require('./lib/cors-anywhere'); // Ensure this path is correct
 
-// Grab the blacklist from the command-line so that we can update the blacklist without deploying
-// again. CORS Anywhere is open by design, and this blacklist is not used, except for countering
-// immediate abuse (e.g. denial of service). If you want to block all origins except for some,
-// use originWhitelist instead.
-var originBlacklist = parseEnvList(process.env.CORSANYWHERE_BLACKLIST);
-var originWhitelist = parseEnvList(process.env.CORSANYWHERE_WHITELIST);
+// --- CORS Anywhere Setup ---
+const corsProxy = cors_anywhere.createServer({
+    originBlacklist: parseEnvList(process.env.CORSANYWHERE_BLACKLIST),
+    originWhitelist: parseEnvList(process.env.CORSANYWHERE_WHITELIST),
+    requireHeader: ['origin', 'x-requested-with'],
+    removeHeaders: ['cookie', 'cookie2'],
+    redirectSameOrigin: true,
+    httpProxyOptions: { xfwd: false },
+});
+
 function parseEnvList(env) {
-  if (!env) {
-    return [];
-  }
-  return env.split(',');
+    return env ? env.split(',') : [];
 }
 
-// Set up rate-limiting to avoid abuse of the public CORS Anywhere server.
-var checkRateLimit = require('./lib/rate-limit')(process.env.CORSANYWHERE_RATELIMIT);
+// --- The Main Handler (Router) ---
+module.exports = (req, res) => {
+    const { pathname } = url.parse(req.url);
 
-var cors_proxy = require('./lib/cors-anywhere');
-cors_proxy.createServer({
-  originBlacklist: originBlacklist,
-  originWhitelist: originWhitelist,
-  requireHeader: ['origin', 'x-requested-with'],
-  checkRateLimit: checkRateLimit,
-  removeHeaders: [
-    'cookie',
-    'cookie2',
-    // Strip Heroku-specific headers
-    'x-request-start',
-    'x-request-id',
-    'via',
-    'connect-time',
-    'total-route-time',
-    // Other Heroku added debug headers
-    // 'x-forwarded-for',
-    // 'x-forwarded-proto',
-    // 'x-forwarded-port',
-  ],
-  redirectSameOrigin: true,
-  httpProxyOptions: {
-    // Do not add X-Forwarded-For, etc. headers, because Heroku already adds it.
-    xfwd: false,
-  },
-}).listen(port, host, function() {
-  console.log('Running CORS Anywhere on ' + host + ':' + port);
-});
+    // 1. Route to CORS Anywhere
+    if (pathname.startsWith('/anywhere')) {
+        // Strip the '/anywhere' prefix before passing to cors-anywhere
+        req.url = req.url.replace(/^\/anywhere/, '');
+        return corsProxy.emit('request', req, res);
+    }
+
+    // 2. Route to Custom Proxy
+    if (pathname.startsWith('/proxy')) {
+        return handleCustomProxy(req, res);
+    }
+
+    // 3. Fallback
+    res.statusCode = 404;
+    res.end('Not Found. Use /anywhere/URL or /proxy/URL');
+};
+
+// --- Custom Proxy Logic ---
+function handleCustomProxy(req, res) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        return res.end();
+    }
+
+    // Extract target: remove "/proxy/" and ensure it starts with https://
+    let targetPath = req.url.replace(/^\/proxy\/?/, '');
+    if (targetPath.startsWith('/')) targetPath = targetPath.substring(1);
+    
+    const initialUrl = targetPath.startsWith('http') ? targetPath : 'https://' + targetPath;
+
+    function fetchUrl(currentUrl, redirectCount = 0) {
+        if (redirectCount > 5) {
+            res.writeHead(500);
+            return res.end('Proxy Error: Too many redirects');
+        }
+
+        https.get(currentUrl, (proxyRes) => {
+            if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
+                const nextUrl = new URL(proxyRes.headers.location, currentUrl).href;
+                return fetchUrl(nextUrl, redirectCount + 1);
+            }
+
+            const headersToForward = { ...proxyRes.headers };
+            delete headersToForward['host'];
+            delete headersToForward['connection'];
+
+            res.writeHead(proxyRes.statusCode, headersToForward);
+            proxyRes.pipe(res);
+        }).on('error', (e) => {
+            res.writeHead(500);
+            res.end('Proxy Error: ' + e.message);
+        });
+    }
+
+    fetchUrl(initialUrl);
+}
