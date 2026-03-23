@@ -4,60 +4,56 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const app = express();
 
-// 1. Expanded CORS for testing (You can restrict this to starnhl.com later)
+// 1. Broad CORS for Streaming (Crucial for .mpd players)
 app.use(cors({
-    origin: true, // Allows any origin to bypass CORS for testing
-    credentials: true
+    origin: '*', 
+    methods: ['GET', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Range'],
+    exposedHeaders: ['Content-Length', 'Content-Range']
 }));
 
-app.get('/', (req, res) => res.send('OQEE Proxy Active'));
+app.get('/', (req, res) => res.send('Proxy is Online'));
 
-// 2. The Universal Proxy Handler
-app.use('/:targetUrl*', (req, res, next) => {
-    // Reconstruct the URL from the full path to avoid slash-collapsing issues
-    let rawPath = req.url.substring(1); // Removes the leading "/"
-    
-    // Fix: If Vercel/Express collapsed https:// into https:/
-    if (rawPath.startsWith('http:/') && !rawPath.startsWith('http://')) {
-        rawPath = rawPath.replace('http:/', 'http://');
-    } else if (rawPath.startsWith('https:/') && !rawPath.startsWith('https://')) {
-        rawPath = rawPath.replace('https:/', 'https://');
+// 2. The Universal Proxy Logic
+app.use((req, res, next) => {
+    // We use req.url instead of params to avoid Express/Vercel URL decoding issues
+    let targetPath = req.url.substring(1); // Remove the leading "/"
+
+    if (!targetPath || targetPath === 'favicon.ico') return next();
+
+    // FIX: Re-insert missing slashes if Vercel collapsed them
+    if (targetPath.startsWith('https:/') && !targetPath.startsWith('https://')) {
+        targetPath = targetPath.replace('https:/', 'https://');
+    } else if (targetPath.startsWith('http:/') && !targetPath.startsWith('http://')) {
+        targetPath = targetPath.replace('http:/', 'http://');
     }
 
-    if (!rawPath || rawPath === 'favicon.ico') return next();
-
-    // Determine the base target (The domain)
-    let targetUrl;
     try {
-        const urlObj = new URL(rawPath);
-        targetUrl = urlObj.origin;
+        const urlObj = new URL(targetPath);
+        
+        return createProxyMiddleware({
+            target: urlObj.origin,
+            changeOrigin: true,
+            followRedirects: true,
+            // Rewrite the path to match the target's internal path
+            pathRewrite: () => urlObj.pathname + urlObj.search,
+            onProxyRes: (proxyRes) => {
+                // Force CORS headers on the outgoing response
+                proxyRes.headers['Access-Control-Allow-Origin'] = '*';
+                proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS';
+                // Remove security headers that might block the stream from playing
+                delete proxyRes.headers['content-security-policy'];
+                delete proxyRes.headers['x-frame-options'];
+            },
+            onError: (err, req, res) => {
+                console.error('Proxy Error:', err);
+                res.status(500).send('Proxy Error: Could not connect to target.');
+            }
+        })(req, res, next);
     } catch (e) {
-        return res.status(400).send('Invalid Target URL');
+        // If URL parsing fails, show the user what we tried to parse
+        return res.status(400).send(`Invalid Target URL: ${targetPath}`);
     }
-
-    return createProxyMiddleware({
-        target: targetUrl,
-        changeOrigin: true,
-        followRedirects: true,
-        pathRewrite: (path) => {
-            // This extracts just the path part from the full URL provided
-            // e.g., from https://site.com/video.mpd, it keeps /video.mpd
-            const fullUrl = path.substring(1).replace('https:/', 'https://').replace('http:/', 'http://');
-            return new URL(fullUrl).pathname + new URL(fullUrl).search;
-        },
-        onProxyRes: (proxyRes, req, res) => {
-            // CRITICAL: Overwrite CORS headers from the original server
-            proxyRes.headers['Access-Control-Allow-Origin'] = '*';
-            proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
-            proxyRes.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization';
-            
-            // For Video Streaming (.mpd, .m3u8)
-            delete proxyRes.headers['content-security-policy'];
-        },
-        onError: (err, req, res) => {
-            res.status(500).send('Proxy Error');
-        }
-    })(req, res, next);
 });
 
 module.exports = app;
