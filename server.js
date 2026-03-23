@@ -49,11 +49,19 @@ function handleCustomProxy(req, res) {
         return res.end();
     }
 
-    // Extract target: remove "/proxy/" and ensure it starts with https://
+    // 1. Clean the URL
+    // Removes '/proxy/' prefix and any leading slashes
     let targetPath = req.url.replace(/^\/proxy\/?/, '');
-    if (targetPath.startsWith('/')) targetPath = targetPath.substring(1);
     
+    if (!targetPath) {
+        res.writeHead(400);
+        return res.end('Error: No target URL provided');
+    }
+
+    // 2. Ensure it's a full URL
     const initialUrl = targetPath.startsWith('http') ? targetPath : 'https://' + targetPath;
+
+    console.log(`Proxying to: ${initialUrl}`);
 
     function fetchUrl(currentUrl, redirectCount = 0) {
         if (redirectCount > 5) {
@@ -61,22 +69,45 @@ function handleCustomProxy(req, res) {
             return res.end('Proxy Error: Too many redirects');
         }
 
-        https.get(currentUrl, (proxyRes) => {
-            if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
-                const nextUrl = new URL(proxyRes.headers.location, currentUrl).href;
-                return fetchUrl(nextUrl, redirectCount + 1);
-            }
+        try {
+            const request = https.get(currentUrl, (proxyRes) => {
+                // Handle Redirects
+                if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
+                    const nextUrl = new URL(proxyRes.headers.location, currentUrl).href;
+                    return fetchUrl(nextUrl, redirectCount + 1);
+                }
 
-            const headersToForward = { ...proxyRes.headers };
-            delete headersToForward['host'];
-            delete headersToForward['connection'];
+                // Forward Headers
+                const headersToForward = { ...proxyRes.headers };
+                delete headersToForward['host'];
+                delete headersToForward['connection'];
+                delete headersToForward['content-encoding']; // Avoid double-compression issues
 
-            res.writeHead(proxyRes.statusCode, headersToForward);
-            proxyRes.pipe(res);
-        }).on('error', (e) => {
+                res.writeHead(proxyRes.statusCode, headersToForward);
+                proxyRes.pipe(res);
+            });
+
+            request.on('error', (e) => {
+                console.error("Fetch Error:", e.message);
+                if (!res.headersSent) {
+                    res.writeHead(500);
+                    res.end('Proxy Error: ' + e.message);
+                }
+            });
+
+            // Set a timeout to prevent hanging
+            request.setTimeout(8000, () => {
+                request.destroy();
+                if (!res.headersSent) {
+                    res.writeHead(504);
+                    res.end('Gateway Timeout');
+                }
+            });
+
+        } catch (err) {
             res.writeHead(500);
-            res.end('Proxy Error: ' + e.message);
-        });
+            res.end('Invalid URL or Protocol');
+        }
     }
 
     fetchUrl(initialUrl);
