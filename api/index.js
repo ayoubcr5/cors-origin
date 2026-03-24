@@ -1,59 +1,165 @@
-const express = require('express');
-const cors = require('cors');
-const { createProxyMiddleware } = require('http-proxy-middleware');
+const http = require('http');
+const https = require('https');
 
-const app = express();
+const MAX_REDIRECTS = 5;
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'host'
+]);
 
-// 1. Broad CORS for Streaming (Crucial for .mpd players)
-app.use(cors({
-    origin: '*', 
-    methods: ['GET', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Range'],
-    exposedHeaders: ['Content-Length', 'Content-Range']
-}));
+function getRequestUrl(req) {
+  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+  const proto = req.headers['x-forwarded-proto'] || 'https';
+  return new URL(req.url, `${proto}://${host}`);
+}
 
-app.get('/', (req, res) => res.send('Proxy is Online'));
+function decodeRepeatedly(value, max = 3) {
+  let current = String(value || '').trim();
 
-// 2. The Universal Proxy Logic
-app.use((req, res, next) => {
-    // We use req.url instead of params to avoid Express/Vercel URL decoding issues
-    let targetPath = req.url.substring(1); // Remove the leading "/"
-
-    if (!targetPath || targetPath === 'favicon.ico') return next();
-
-    // FIX: Re-insert missing slashes if Vercel collapsed them
-    if (targetPath.startsWith('https:/') && !targetPath.startsWith('https://')) {
-        targetPath = targetPath.replace('https:/', 'https://');
-    } else if (targetPath.startsWith('http:/') && !targetPath.startsWith('http://')) {
-        targetPath = targetPath.replace('http:/', 'http://');
-    }
-
+  for (let i = 0; i < max; i += 1) {
     try {
-        const urlObj = new URL(targetPath);
-        
-        return createProxyMiddleware({
-            target: urlObj.origin,
-            changeOrigin: true,
-            followRedirects: true,
-            // Rewrite the path to match the target's internal path
-            pathRewrite: () => urlObj.pathname + urlObj.search,
-            onProxyRes: (proxyRes) => {
-                // Force CORS headers on the outgoing response
-                proxyRes.headers['Access-Control-Allow-Origin'] = '*';
-                proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS';
-                // Remove security headers that might block the stream from playing
-                delete proxyRes.headers['content-security-policy'];
-                delete proxyRes.headers['x-frame-options'];
-            },
-            onError: (err, req, res) => {
-                console.error('Proxy Error:', err);
-                res.status(500).send('Proxy Error: Could not connect to target.');
-            }
-        })(req, res, next);
-    } catch (e) {
-        // If URL parsing fails, show the user what we tried to parse
-        return res.status(400).send(`Invalid Target URL: ${targetPath}`);
+      const decoded = decodeURIComponent(current);
+      if (decoded === current) break;
+      current = decoded;
+    } catch {
+      break;
     }
-});
+  }
 
-module.exports = app;
+  return current;
+}
+
+function normalizeTarget(raw) {
+  const decoded = decodeRepeatedly(raw);
+  if (!decoded) return null;
+
+  const withProtocol = /^https?:\/\//i.test(decoded)
+    ? decoded
+    : `https://${decoded.replace(/^\/+/, '')}`;
+
+  try {
+    return new URL(withProtocol);
+  } catch {
+    return null;
+  }
+}
+
+function setCors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+}
+
+function forwardHeaders(sourceHeaders) {
+  const headers = {};
+
+  for (const [key, value] of Object.entries(sourceHeaders || {})) {
+    if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
+      headers[key] = value;
+    }
+  }
+
+  return headers;
+}
+
+function fetchUrl(targetUrl, res, redirectCount = 0) {
+  if (redirectCount > MAX_REDIRECTS) {
+    res.writeHead(500);
+    res.end('Proxy Error: Too many redirects');
+    return;
+  }
+
+  const transport = targetUrl.protocol === 'http:' ? http : https;
+
+  const upstreamReq = transport.request(
+    targetUrl,
+    {
+      method: 'GET',
+      headers: {
+        'user-agent': 'Mozilla/5.0',
+        accept: '*/*'
+      }
+    },
+    (upstreamRes) => {
+      const statusCode = upstreamRes.statusCode || 500;
+      const location = upstreamRes.headers.location;
+
+      if ([301, 302, 303, 307, 308].includes(statusCode) && location) {
+        const nextUrl = new URL(location, targetUrl);
+        upstreamRes.resume();
+        return fetchUrl(nextUrl, res, redirectCount + 1);
+      }
+
+      const headers = forwardHeaders(upstreamRes.headers);
+      setCors(res);
+      res.writeHead(statusCode, headers);
+      upstreamRes.pipe(res);
+    }
+  );
+
+  upstreamReq.on('error', (err) => {
+    if (!res.headersSent) {
+      setCors(res);
+      res.writeHead(500);
+      res.end(`Proxy Error: ${err.message}`);
+    }
+  });
+
+  upstreamReq.end();
+}
+
+module.exports = (req, res) => {
+  setCors(res);
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  const requestUrl = getRequestUrl(req);
+
+  if (requestUrl.pathname === '/api/proxy' || requestUrl.pathname === '/proxy') {
+    const rawUrl = requestUrl.searchParams.get('url');
+    if (!rawUrl) {
+      res.writeHead(400);
+      res.end('Missing url parameter');
+      return;
+    }
+
+    const targetUrl = normalizeTarget(rawUrl);
+    if (!targetUrl) {
+      res.writeHead(400);
+      res.end(`Invalid Target URL: ${rawUrl}`);
+      return;
+    }
+
+    return fetchUrl(targetUrl, res);
+  }
+
+  const rawPathTarget = requestUrl.pathname
+    .replace(/^\/api\/proxy\/?/, '')
+    .replace(/^\/proxy\/?/, '');
+
+  if (!rawPathTarget) {
+    res.writeHead(200);
+    res.end('Proxy is active');
+    return;
+  }
+
+  const targetUrl = normalizeTarget(rawPathTarget);
+  if (!targetUrl) {
+    res.writeHead(400);
+    res.end(`Invalid Target URL: ${rawPathTarget}`);
+    return;
+  }
+
+  return fetchUrl(targetUrl, res);
+};
