@@ -2,27 +2,21 @@ const http = require('http');
 const https = require('https');
 
 const MAX_REDIRECTS = 5;
-const HOP_BY_HOP_HEADERS = new Set([
-  'connection',
-  'keep-alive',
-  'proxy-authenticate',
-  'proxy-authorization',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'upgrade',
-  'host'
-]);
 
-function getRequestUrl(req) {
-  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+function setCors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+}
+
+function getBaseUrl(req) {
   const proto = req.headers['x-forwarded-proto'] || 'https';
-  return new URL(req.url, `${proto}://${host}`);
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  return `${proto}://${host}`;
 }
 
 function decodeRepeatedly(value, max = 3) {
   let current = String(value || '').trim();
-
   for (let i = 0; i < max; i += 1) {
     try {
       const decoded = decodeURIComponent(current);
@@ -32,7 +26,6 @@ function decodeRepeatedly(value, max = 3) {
       break;
     }
   }
-
   return current;
 }
 
@@ -51,34 +44,42 @@ function normalizeTarget(raw) {
   }
 }
 
-function setCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-}
+function filterHeaders(headers) {
+  const blocked = new Set([
+    'host',
+    'connection',
+    'content-length',
+    'transfer-encoding'
+  ]);
 
-function forwardHeaders(sourceHeaders) {
-  const headers = {};
-
-  for (const [key, value] of Object.entries(sourceHeaders || {})) {
-    if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
-      headers[key] = value;
+  const out = {};
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (!blocked.has(key.toLowerCase())) {
+      out[key] = value;
     }
   }
-
-  return headers;
+  return out;
 }
 
-function fetchUrl(targetUrl, res, redirectCount = 0) {
+function proxifyLocation(req, location, currentUrl) {
+  try {
+    const absolute = new URL(location, currentUrl).toString();
+    return `${getBaseUrl(req)}/api/proxy?url=${encodeURIComponent(absolute)}`;
+  } catch {
+    return location;
+  }
+}
+
+function fetchUrl(req, res, targetUrl, redirectCount = 0) {
   if (redirectCount > MAX_REDIRECTS) {
-    res.writeHead(500);
+    res.statusCode = 500;
     res.end('Proxy Error: Too many redirects');
     return;
   }
 
-  const transport = targetUrl.protocol === 'http:' ? http : https;
+  const client = targetUrl.protocol === 'http:' ? http : https;
 
-  const upstreamReq = transport.request(
+  const upstreamReq = client.request(
     targetUrl,
     {
       method: 'GET',
@@ -94,10 +95,15 @@ function fetchUrl(targetUrl, res, redirectCount = 0) {
       if ([301, 302, 303, 307, 308].includes(statusCode) && location) {
         const nextUrl = new URL(location, targetUrl);
         upstreamRes.resume();
-        return fetchUrl(nextUrl, res, redirectCount + 1);
+        return fetchUrl(req, res, nextUrl, redirectCount + 1);
       }
 
-      const headers = forwardHeaders(upstreamRes.headers);
+      const headers = filterHeaders(upstreamRes.headers);
+
+      if (headers.location) {
+        headers.location = proxifyLocation(req, headers.location, targetUrl);
+      }
+
       setCors(res);
       res.writeHead(statusCode, headers);
       upstreamRes.pipe(res);
@@ -107,7 +113,7 @@ function fetchUrl(targetUrl, res, redirectCount = 0) {
   upstreamReq.on('error', (err) => {
     if (!res.headersSent) {
       setCors(res);
-      res.writeHead(500);
+      res.statusCode = 500;
       res.end(`Proxy Error: ${err.message}`);
     }
   });
@@ -119,47 +125,35 @@ module.exports = (req, res) => {
   setCors(res);
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(200);
+    res.statusCode = 200;
     res.end();
     return;
   }
 
-  const requestUrl = getRequestUrl(req);
+  const baseUrl = getBaseUrl(req);
+  const requestUrl = new URL(req.url, baseUrl);
 
-  if (requestUrl.pathname === '/api/proxy' || requestUrl.pathname === '/proxy') {
-    const rawUrl = requestUrl.searchParams.get('url');
-    if (!rawUrl) {
-      res.writeHead(400);
-      res.end('Missing url parameter');
-      return;
-    }
+  let rawTarget = requestUrl.searchParams.get('url');
 
-    const targetUrl = normalizeTarget(rawUrl);
-    if (!targetUrl) {
-      res.writeHead(400);
-      res.end(`Invalid Target URL: ${rawUrl}`);
-      return;
-    }
-
-    return fetchUrl(targetUrl, res);
+  if (!rawTarget) {
+    rawTarget = requestUrl.pathname
+      .replace(/^\/api\/proxy\/?/, '')
+      .replace(/^\/proxy\/?/, '');
   }
 
-  const rawPathTarget = requestUrl.pathname
-    .replace(/^\/api\/proxy\/?/, '')
-    .replace(/^\/proxy\/?/, '');
-
-  if (!rawPathTarget) {
-    res.writeHead(200);
-    res.end('Proxy is active');
+  if (!rawTarget) {
+    res.statusCode = 400;
+    res.end('Missing url parameter');
     return;
   }
 
-  const targetUrl = normalizeTarget(rawPathTarget);
+  const targetUrl = normalizeTarget(rawTarget);
+
   if (!targetUrl) {
-    res.writeHead(400);
-    res.end(`Invalid Target URL: ${rawPathTarget}`);
+    res.statusCode = 400;
+    res.end(`Invalid Target URL: ${rawTarget}`);
     return;
   }
 
-  return fetchUrl(targetUrl, res);
+  fetchUrl(req, res, targetUrl);
 };
