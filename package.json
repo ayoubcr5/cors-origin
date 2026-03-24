@@ -1,4 +1,8 @@
 {
   "name": "cors-origin-france",
-  "private": true
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "express": "^4.21.2"
+  }
 }
