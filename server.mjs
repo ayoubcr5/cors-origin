@@ -1,23 +1,21 @@
+import express from 'express';
+import http from 'http';
+import https from 'https';
+
+const app = express();
 const MAX_REDIRECTS = 5;
 
-const HOP_BY_HOP_HEADERS = new Set([
-  'connection',
-  'keep-alive',
-  'proxy-authenticate',
-  'proxy-authorization',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'upgrade',
-  'content-length'
-]);
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
 
-function makeCorsHeaders(headers = new Headers()) {
-  headers.set('Access-Control-Allow-Origin', '*');
-  headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  headers.set('Access-Control-Allow-Headers', '*');
-  return headers;
-}
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+
+  next();
+});
 
 function decodeRepeatedly(value, max = 3) {
   let current = String(value || '').trim();
@@ -50,121 +48,78 @@ function normalizeTarget(raw) {
   }
 }
 
-function buildProxyUrl(requestUrl, absoluteUrl) {
-  const base = new URL(requestUrl);
-  return `${base.origin}/api/proxy?url=${encodeURIComponent(absoluteUrl)}`;
+function safeHeaders(headers) {
+  const out = { ...headers };
+  delete out.host;
+  delete out.connection;
+  delete out['content-length'];
+  delete out['transfer-encoding'];
+  return out;
 }
 
-function filterResponseHeaders(inputHeaders) {
-  const headers = new Headers(inputHeaders);
-
-  for (const key of [...headers.keys()]) {
-    if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
-      headers.delete(key);
-    }
+function proxyFetch(targetUrl, res, redirectCount = 0) {
+  if (redirectCount > MAX_REDIRECTS) {
+    return res.status(500).send('Proxy Error: Too many redirects');
   }
 
-  return makeCorsHeaders(headers);
-}
+  const client = targetUrl.protocol === 'http:' ? http : https;
 
-async function fetchWithRedirects(targetUrl, request, depth = 0) {
-  if (depth > MAX_REDIRECTS) {
-    return new Response('Proxy Error: Too many redirects', { status: 500 });
-  }
+  const upstreamReq = client.get(targetUrl, (upstreamRes) => {
+    const status = upstreamRes.statusCode || 500;
+    const location = upstreamRes.headers.location;
 
-  const upstream = await fetch(targetUrl.toString(), {
-    method: 'GET',
-    redirect: 'manual',
-    headers: {
-      'user-agent': request.headers.get('user-agent') || 'Mozilla/5.0',
-      'accept': request.headers.get('accept') || '*/*'
+    if ([301, 302, 303, 307, 308].includes(status) && location) {
+      const nextUrl = new URL(location, targetUrl).toString();
+      return proxyFetch(nextUrl, res, redirectCount + 1);
     }
+
+    res.writeHead(status, safeHeaders(upstreamRes.headers));
+    upstreamRes.pipe(res);
   });
 
-  if ([301, 302, 303, 307, 308].includes(upstream.status)) {
-    const location = upstream.headers.get('location');
-    if (location) {
-      const nextUrl = new URL(location, targetUrl);
-      return fetchWithRedirects(nextUrl, request, depth + 1);
+  upstreamReq.on('error', (err) => {
+    if (!res.headersSent) {
+      res.status(500).send(`Proxy Error: ${err.message}`);
     }
-  }
-
-  const headers = filterResponseHeaders(upstream.headers);
-  const location = upstream.headers.get('location');
-
-  if (location) {
-    try {
-      const absolute = new URL(location, targetUrl).toString();
-      headers.set('location', buildProxyUrl(request.url, absolute));
-    } catch {
-      // keep original if parsing fails
-    }
-  }
-
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers
   });
 }
 
-export default {
-  async fetch(request) {
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: makeCorsHeaders()
-      });
-    }
+app.get('/', (req, res) => {
+  res.send('Proxy is active');
+});
 
-    const url = new URL(request.url);
+app.get('/api/proxy', (req, res) => {
+  const targetUrl = normalizeTarget(req.query.url);
 
-    if (url.pathname === '/') {
-      return new Response('Proxy is active', {
-        status: 200,
-        headers: makeCorsHeaders(new Headers({ 'content-type': 'text/plain; charset=utf-8' }))
-      });
-    }
-
-    let rawTarget = url.searchParams.get('url');
-
-    if (!rawTarget && url.pathname.startsWith('/api/proxy/')) {
-      rawTarget = url.pathname.slice('/api/proxy/'.length);
-    }
-
-    if (!rawTarget && url.pathname.startsWith('/proxy/')) {
-      rawTarget = url.pathname.slice('/proxy/'.length);
-    }
-
-    if (!rawTarget && url.pathname === '/api/proxy') {
-      return new Response('Missing url parameter', {
-        status: 400,
-        headers: makeCorsHeaders(new Headers({ 'content-type': 'text/plain; charset=utf-8' }))
-      });
-    }
-
-    if (!rawTarget) {
-      return new Response('Missing url parameter', {
-        status: 400,
-        headers: makeCorsHeaders(new Headers({ 'content-type': 'text/plain; charset=utf-8' }))
-      });
-    }
-
-    const targetUrl = normalizeTarget(rawTarget);
-
-    if (!targetUrl) {
-      return new Response(`Invalid Target URL: ${rawTarget}`, {
-        status: 400,
-        headers: makeCorsHeaders(new Headers({ 'content-type': 'text/plain; charset=utf-8' }))
-      });
-    }
-
-    try {
-      return await fetchWithRedirects(targetUrl, request);
-    } catch (error) {
-      return new Response(`Proxy Error: ${error.message}`, {
-        status: 500,
-        headers: makeCorsHeaders(new Headers({ 'content-type': 'text/plain; charset=utf-8' }))
-      });
-    }
+  if (!req.query.url) {
+    return res.status(400).send('Missing url parameter');
   }
-};
+
+  if (!targetUrl) {
+    return res.status(400).send(`Invalid Target URL: ${req.query.url}`);
+  }
+
+  proxyFetch(targetUrl.toString(), res);
+});
+
+app.get(/^\/api\/proxy\/(.+)$/, (req, res) => {
+  const targetUrl = normalizeTarget(req.params[0]);
+
+  if (!targetUrl) {
+    return res.status(400).send(`Invalid Target URL: ${req.params[0]}`);
+  }
+
+  proxyFetch(targetUrl.toString(), res);
+});
+
+app.get(/^\/proxy\/(.+)$/, (req, res) => {
+  const targetUrl = normalizeTarget(req.params[0]);
+
+  if (!targetUrl) {
+    return res.status(400).send(`Invalid Target URL: ${req.params[0]}`);
+  }
+
+  proxyFetch(targetUrl.toString(), res);
+});
+
+export default app;
